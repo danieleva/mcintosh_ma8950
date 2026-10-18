@@ -1,12 +1,10 @@
 import asyncio
 import logging
+import re
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-try:
-    import serial_asyncio
-except ImportError:
-    serial_asyncio = None
+import serialx
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -15,6 +13,8 @@ BUFFER_SIZE = 1024
 
 # Translation tables for input sources
 SOURCE_MAPPING = {
+    "U": "Next Input",
+    "D": "Previous Input",
     "1": "BAL 1",
     "2": "UNBAL 1",
     "3": "UNBAL 2",
@@ -30,10 +30,9 @@ SOURCE_MAPPING = {
     "13": "OPTI 2",
     "14": "USB",
     "15": "MCT",
-    "16": "HDMI",
+    "16": "HDMI (DA2 only)",
 }
 
-# Reverse mapping to look up command IDs from human-readable names
 REVERSE_SOURCE_MAPPING = {v: k for k, v in SOURCE_MAPPING.items()}
 
 class McIntoshMA8950API:
@@ -43,7 +42,6 @@ class McIntoshMA8950API:
     """
 
     def __init__(self, port_url: str, baudrate: int = 115200):
-        """Initialize the McIntosh API."""
         self.port_url = port_url
         self.baudrate = baudrate
         self._reader: Optional[asyncio.StreamReader] = None
@@ -62,7 +60,6 @@ class McIntoshMA8950API:
             self.port = parsed.port
 
     async def connect(self) -> bool:
-        """Establish a connection to the amplifier (TCP or Serial)."""
         if self._connected:
             return True
 
@@ -75,27 +72,19 @@ class McIntoshMA8950API:
                     timeout=TIMEOUT
                 )
             else:
-                if serial_asyncio is None:
-                    _LOGGER.error("pyserial-asyncio is required for serial connections.")
-                    return False
-                
                 self._reader, self._writer = await asyncio.wait_for(
-                    serial_asyncio.open_serial_connection(url=self.port_url, baudrate=self.baudrate),
+                    serialx.open_serial_connection(url=self.port_url, baudrate=self.baudrate),
                     timeout=TIMEOUT
                 )
                 
             self._connected = True
             _LOGGER.info(f"Successfully connected to McIntosh MA8950 via {self.port_url}.")
             return True
-        except asyncio.TimeoutError:
-            _LOGGER.error(f"Connection to {self.port_url} timed out.")
-            return False
         except Exception as e:
             _LOGGER.error(f"Unexpected error connecting to McIntosh MA8950: {e}")
             return False
 
     async def disconnect(self):
-        """Close the connection."""
         if self._writer:
             try:
                 self._writer.close()
@@ -109,93 +98,110 @@ class McIntoshMA8950API:
                 _LOGGER.debug("Disconnected from McIntosh MA8950.")
 
     async def send_command(self, command: str) -> Optional[str]:
-        """Send a text command to the amplifier and read the response."""
-        if not self._connected:
-            success = await self.connect()
-            if not success:
-                return None
-
         async with self._lock:
-            try:
-                if not command.endswith('\r'):
-                    command += '\r'
+            if not self._connected or not self._writer:
+                success = await self.connect()
+                if not success:
+                    return None
 
-                _LOGGER.debug(f"Sending command: {command.strip()}")
-                self._writer.write(command.encode('utf-8'))
+            try:
+                if self._reader:
+                    try:
+                        while True:
+                            stale_bytes = await asyncio.wait_for(self._reader.read(BUFFER_SIZE), timeout=0.05)
+                            if not stale_bytes:
+                                break
+                    except (asyncio.TimeoutError, Exception):
+                        pass
+
+                if not command.startswith('('):
+                    command = f"({command})"
+                
+                command_with_cr = f"{command}\r"
+                expected_prefix = command.strip('()').split(' ')[0]
+
+                self._writer.write(command_with_cr.encode('utf-8'))
                 await self._writer.drain()
 
-                response_bytes = await asyncio.wait_for(
-                    self._reader.readuntil(b'\r'),
-                    timeout=TIMEOUT
-                )
+                for _ in range(10):
+                    response_bytes = await asyncio.wait_for(
+                        self._reader.readuntil(b')'),
+                        timeout=TIMEOUT
+                    )
+                    
+                    response_str = response_bytes.decode('utf-8', errors='ignore').strip('()\r\n ')
+                    
+                    if response_str.startswith(expected_prefix):
+                        return response_str
+                        
+                _LOGGER.warning(f"Did not receive matching response for {command} within loop")
+                return None
                 
-                response = response_bytes.decode('utf-8').strip()
-                _LOGGER.debug(f"Received response: {response}")
-                return response
-
-            except (asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
-                _LOGGER.error(f"Connection issue during communication: {e}")
-                await self.disconnect()
+            except asyncio.TimeoutError:
+                _LOGGER.warning(f"Timeout waiting for response to command: {command}")
                 return None
             except Exception as e:
-                _LOGGER.error(f"Error sending command: {e}")
-                await self.disconnect()
+                _LOGGER.error(f"Error communicating: {e}")
+                self._reader = None
+                self._writer = None
+                self._connected = False
                 return None
 
     async def turn_on(self) -> bool:
-        """Turn on the amplifier."""
         response = await self.send_command("PWR 1")
-        if response and "PWR 1" in response:
-            return True
-        return False
+        return bool(response and "PWR 1" in response)
 
     async def turn_off(self) -> bool:
-        """Turn off the amplifier."""
         response = await self.send_command("PWR 0")
-        if response and "PWR 0" in response:
-            return True
-        return False
+        return bool(response and "PWR 0" in response)
 
     async def set_volume(self, volume: int) -> bool:
-        """Set the volume level."""
         response = await self.send_command(f"VOL {volume}")
-        if response and "VOL" in response:
-            return True
-        return False
+        return bool(response and "VOL" in response)
+
+    async def mute_on(self) -> bool:
+        """Mute the amplifier."""
+        response = await self.send_command("MUT 1")
+        return bool(response and "MUT 1" in response)
+
+    async def mute_off(self) -> bool:
+        """Unmute the amplifier."""
+        response = await self.send_command("MUT 0")
+        return bool(response and "MUT 0" in response)
 
     async def select_source(self, source: str) -> bool:
-        """Select the input source using human-readable names."""
-        # Translate Home Assistant name (e.g. "BAL 1") to amp command (e.g. "1")
         amp_command = REVERSE_SOURCE_MAPPING.get(source, source)
-        
-        _LOGGER.info(f"Setting McIntosh MA8950 source to {source} (Command: {amp_command})")
         response = await self.send_command(f"INP {amp_command}")
-        
-        if response and "INP" in response:
-            return True
-        return False
+        return bool(response and "INP" in response)
 
     async def get_status(self) -> dict:
-        """Read the current status of the amplifier."""
         status = {}
         
-        pwr_resp = await self.send_command("PWR ?")
-        if pwr_resp:
-            status["power"] = "PWR 1" in pwr_resp
+        pwr_resp = await self.send_command("PWR")
+        if not pwr_resp:
+            return status
 
-        vol_resp = await self.send_command("VOL ?")
-        if vol_resp and vol_resp.startswith("VOL "):
-            try:
-                status["volume"] = int(vol_resp.split(" ")[1])
-            except ValueError:
-                pass
+        power_on = "PWR 1" in pwr_resp
+        status["power"] = power_on
+        
+        if not power_on:
+            return status
 
-        inp_resp = await self.send_command("INP ?")
-        if inp_resp and inp_resp.startswith("INP "):
-            parts = inp_resp.split(" ", 1)
-            if len(parts) > 1:
-                raw_source = parts[1].strip()
-                # Translate amp response (e.g. "1") to Home Assistant name (e.g. "BAL 1")
+        vol_resp = await self.send_command("VOL")
+        if vol_resp:
+            match = re.search(r'VOL\s*(\d+)', vol_resp)
+            if match:
+                status["volume"] = int(match.group(1))
+
+        mut_resp = await self.send_command("MUT")
+        if mut_resp:
+            status["mute"] = "MUT 1" in mut_resp
+
+        inp_resp = await self.send_command("INP")
+        if inp_resp:
+            match = re.search(r'INP\s*(\d+)', inp_resp)
+            if match:
+                raw_source = match.group(1)
                 status["source"] = SOURCE_MAPPING.get(raw_source, raw_source)
 
         return status
