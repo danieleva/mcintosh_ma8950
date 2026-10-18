@@ -1,0 +1,14 @@
+{
+    "domain": "mcintosh_ma8950",
+    "name": "McIntosh MA8950",
+    "codeowners": [],
+    "config_flow": false,
+    "dependencies": [],
+    "documentation": "https://github.com/danieleva/mcintosh_ma8950",
+    "integration_type": "device",
+    "iot_class": "local_polling",
+    "requirements": [
+        "pyserial-asyncio>=0.6"
+    ],
+    "version": "1.0.0"
+}
